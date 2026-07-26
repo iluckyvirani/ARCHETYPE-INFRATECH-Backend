@@ -10,9 +10,22 @@ import migrateRouter from "./routes/migrate.js";
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
+const allowedOrigins = (
+  process.env.CLIENT_ORIGIN || "http://localhost:5173"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes("*")) {
+        callback(null, true);
+        return;
+      }
+      callback(null, allowedOrigins[0] || true);
+    },
   })
 );
 app.use(express.json());
@@ -39,4 +52,10 @@ async function start() {
   });
 }
 
-start();
+if (process.env.VERCEL) {
+  migrate().catch((err) => console.error("Migration failed:", err));
+} else {
+  start();
+}
+
+export default app;
