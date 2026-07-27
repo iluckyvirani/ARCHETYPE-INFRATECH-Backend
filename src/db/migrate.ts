@@ -81,4 +81,14 @@ export async function migrate() {
   await sql`
     UPDATE schedule_items SET invoice_id = client_id WHERE invoice_id IS NULL
   `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS completed BOOLEAN NOT NULL DEFAULT FALSE
+  `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS completed_at DATE
+  `;
 }

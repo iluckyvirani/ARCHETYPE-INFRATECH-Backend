@@ -343,6 +343,49 @@ router.patch("/group/:groupId", async (req, res) => {
   }
 });
 
+/** Settle all dues and mark customer complete */
+router.post("/group/:groupId/complete", async (req, res) => {
+  try {
+    const groupId = req.params.groupId;
+    const today = todayISO();
+    const invoices = await sql`
+      SELECT id FROM clients
+      WHERE group_id = ${groupId} OR id = ${groupId}
+    `;
+    if (!invoices[0]) {
+      res.status(404).json({ error: "Client not found" });
+      return;
+    }
+    const ids = invoices.map((r) => String(r.id));
+    for (const invId of ids) {
+      await sql`
+        UPDATE schedule_items
+        SET paid = TRUE, paid_at = COALESCE(paid_at, ${today})
+        WHERE paid = FALSE
+          AND (
+            invoice_id = ${invId}
+            OR client_id = ${invId}
+            OR client_id = ${groupId}
+          )
+      `;
+      await sql`
+        UPDATE clients
+        SET balance = 0, completed = TRUE, completed_at = ${today}
+        WHERE id = ${invId}
+      `;
+    }
+    await sql`
+      UPDATE clients
+      SET completed = TRUE, completed_at = ${today}, balance = 0
+      WHERE group_id = ${groupId} OR id = ${groupId}
+    `;
+    res.json({ ok: true, completed: true, completedAt: today });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed";
+    res.status(500).json({ error: message });
+  }
+});
+
 router.delete("/group/:groupId", async (req, res) => {
   try {
     const groupId = req.params.groupId;

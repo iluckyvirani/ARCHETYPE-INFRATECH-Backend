@@ -79,10 +79,8 @@ export function calcTotals(input: {
     feeAmount = projectCost;
   }
 
-  const totalBill =
-    input.feeMode === "percentage"
-      ? round2(projectCost + feeAmount + additionalTotal)
-      : round2(feeAmount + additionalTotal);
+  // Billable is fee (+ additional) only — project/post cost is reference, not billed.
+  const totalBill = round2(feeAmount + additionalTotal);
   return {
     projectCost,
     feeAmount,
@@ -249,6 +247,8 @@ export function mapClientRow(row: Record<string, unknown>) {
     oneTimeDueDate: row.one_time_due_date
       ? String(row.one_time_due_date).slice(0, 10)
       : null,
+    completed: Boolean(row.completed),
+    completedAt: toDateOnly(row.completed_at),
     createdAt: (() => {
       const raw = row.created_at;
       if (raw instanceof Date) return raw.toISOString();
