@@ -91,4 +91,24 @@ export async function migrate() {
     ALTER TABLE clients
     ADD COLUMN IF NOT EXISTS completed_at DATE
   `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS work_types JSONB NOT NULL DEFAULT '[]'::jsonb
+  `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS work_type_custom TEXT
+  `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS visit_included BOOLEAN NOT NULL DEFAULT FALSE
+  `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS visit_fee NUMERIC NOT NULL DEFAULT 0
+  `;
 }

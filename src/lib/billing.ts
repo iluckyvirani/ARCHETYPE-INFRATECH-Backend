@@ -19,12 +19,16 @@ export type ClientPayload = {
   name: string;
   location: string;
   projectName: string;
+  workTypes?: string[];
+  workTypeCustom?: string | null;
   feeMode: FeeMode;
   areaSqft?: number | null;
   costPerSqft?: number | null;
   feePercent?: number | null;
   fixedAmount?: number | null;
   additionalWorks?: AdditionalWork[];
+  visitIncluded?: boolean;
+  visitFee?: number | null;
   advanceAmount: number;
   advanceDate?: string | null;
   paymentPlan: PaymentPlan;
@@ -57,6 +61,8 @@ export function calcTotals(input: {
   fixedAmount?: number | null;
   advanceAmount?: number;
   additionalWorks?: AdditionalWork[];
+  visitIncluded?: boolean;
+  visitFee?: number | null;
 }) {
   const area = Number(input.areaSqft) || 0;
   const rate = Number(input.costPerSqft) || 0;
@@ -64,6 +70,9 @@ export function calcTotals(input: {
   const fixed = Number(input.fixedAmount) || 0;
   const advance = Number(input.advanceAmount) || 0;
   const additionalTotal = additionalWorksSum(input.additionalWorks);
+  const visitFee = input.visitIncluded
+    ? 0
+    : round2(Number(input.visitFee) || 0);
 
   let projectCost = 0;
   let feeAmount = 0;
@@ -79,12 +88,12 @@ export function calcTotals(input: {
     feeAmount = projectCost;
   }
 
-  // Billable is fee (+ additional) only — project/post cost is reference, not billed.
-  const totalBill = round2(feeAmount + additionalTotal);
+  const totalBill = round2(feeAmount + additionalTotal + visitFee);
   return {
     projectCost,
     feeAmount,
     additionalTotal,
+    visitFee,
     totalBill,
     balance: round2(Math.max(0, totalBill - advance)),
   };
@@ -213,6 +222,22 @@ export function mapClientRow(row: Record<string, unknown>) {
     name: row.name as string,
     location: row.location as string,
     projectName: row.project_name as string,
+    workTypes: (() => {
+      const raw = row.work_types;
+      if (Array.isArray(raw)) return raw.map((x) => String(x));
+      if (typeof raw === "string") {
+        try {
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed.map((x) => String(x)) : [];
+        } catch {
+          return [];
+        }
+      }
+      return [];
+    })(),
+    workTypeCustom: row.work_type_custom
+      ? String(row.work_type_custom)
+      : null,
     feeMode: row.fee_mode as FeeMode,
     areaSqft: row.area_sqft != null ? Number(row.area_sqft) : null,
     costPerSqft: row.cost_per_sqft != null ? Number(row.cost_per_sqft) : null,
@@ -222,6 +247,8 @@ export function mapClientRow(row: Record<string, unknown>) {
     fixedAmount: row.fixed_amount != null ? Number(row.fixed_amount) : null,
     additionalWorks,
     additionalTotal,
+    visitIncluded: Boolean(row.visit_included),
+    visitFee: row.visit_fee != null ? Number(row.visit_fee) : 0,
     totalBill: Number(row.total_bill),
     advanceAmount: Number(row.advance_amount),
     advanceDate: (() => {

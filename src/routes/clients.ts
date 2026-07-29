@@ -44,9 +44,10 @@ async function insertInvoice(opts: {
 
   await sql`
     INSERT INTO clients (
-      id, group_id, invoice_no, name, location, project_name, fee_mode,
+      id, group_id, invoice_no, name, location, project_name, work_types, work_type_custom, fee_mode,
       area_sqft, cost_per_sqft, fee_percent, project_cost, fee_amount,
-      fixed_amount, additional_works, total_bill, advance_amount, advance_date, balance,
+      fixed_amount, additional_works, visit_included, visit_fee,
+      total_bill, advance_amount, advance_date, balance,
       payment_plan, installment_mode, installment_months, installment_count,
       one_time_due_date
     ) VALUES (
@@ -56,6 +57,8 @@ async function insertInvoice(opts: {
       ${name.trim()},
       ${body.location.trim()},
       ${body.projectName.trim()},
+      ${JSON.stringify(body.workTypes || [])},
+      ${(body.workTypeCustom || "").trim() || null},
       ${body.feeMode},
       ${body.areaSqft ?? null},
       ${body.costPerSqft ?? null},
@@ -68,6 +71,8 @@ async function insertInvoice(opts: {
           (w) => w.name?.trim() && (Number(w.qty) > 0 || Number(w.rate) > 0)
         )
       )},
+      ${Boolean(body.visitIncluded)},
+      ${totals.visitFee},
       ${totals.totalBill},
       ${advance},
       ${advance > 0 ? body.advanceDate || null : null},
