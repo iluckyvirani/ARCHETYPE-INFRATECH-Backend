@@ -88,7 +88,8 @@ export function calcTotals(input: {
     feeAmount = projectCost;
   }
 
-  const totalBill = round2(feeAmount + additionalTotal + visitFee);
+  // Visit fee is recorded for notes only — not part of billable total
+  const totalBill = round2(feeAmount + additionalTotal);
   return {
     projectCost,
     feeAmount,
