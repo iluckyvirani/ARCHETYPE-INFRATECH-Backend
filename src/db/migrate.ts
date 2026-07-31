@@ -111,4 +111,9 @@ export async function migrate() {
     ALTER TABLE clients
     ADD COLUMN IF NOT EXISTS visit_fee NUMERIC NOT NULL DEFAULT 0
   `;
+
+  await sql`
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS floors JSONB NOT NULL DEFAULT '[]'::jsonb
+  `;
 }

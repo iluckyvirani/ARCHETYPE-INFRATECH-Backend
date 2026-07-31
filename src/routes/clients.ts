@@ -8,12 +8,37 @@ import {
   mapScheduleRow,
   todayISO,
   type ClientPayload,
+  type FeeMode,
 } from "../lib/billing.js";
 
 const router = Router();
 
 function id(prefix: string) {
   return `${prefix}_${randomUUID().slice(0, 8)}`;
+}
+
+/** Client / group ID format: A.I-001 … A.I-999, then A.I-1000+ */
+function parseClientGroupNo(groupId: string): number {
+  const m = String(groupId || "").trim().match(/^A\.I-(\d+)$/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function formatClientGroupId(n: number): string {
+  const num = Math.max(1, Math.floor(n));
+  return `A.I-${String(num).padStart(3, "0")}`;
+}
+
+async function nextClientGroupId(): Promise<string> {
+  const rows = await sql`
+    SELECT DISTINCT group_id FROM clients WHERE group_id IS NOT NULL
+  `;
+  let max = 0;
+  for (const row of rows) {
+    max = Math.max(max, parseClientGroupNo(String(row.group_id)));
+  }
+  return formatClientGroupId(max + 1);
 }
 
 async function nextInvoiceNo(): Promise<string> {
@@ -45,7 +70,7 @@ async function insertInvoice(opts: {
   await sql`
     INSERT INTO clients (
       id, group_id, invoice_no, name, location, project_name, work_types, work_type_custom, fee_mode,
-      area_sqft, cost_per_sqft, fee_percent, project_cost, fee_amount,
+      area_sqft, cost_per_sqft, floors, fee_percent, project_cost, fee_amount,
       fixed_amount, additional_works, visit_included, visit_fee,
       total_bill, advance_amount, advance_date, balance,
       payment_plan, installment_mode, installment_months, installment_count,
@@ -62,6 +87,15 @@ async function insertInvoice(opts: {
       ${body.feeMode},
       ${body.areaSqft ?? null},
       ${body.costPerSqft ?? null},
+      ${JSON.stringify(
+        (body.floors || [])
+          .map((f) => ({
+            label: String(f.label || "").trim(),
+            areaSqft: Number(f.areaSqft) || 0,
+            costPerSqft: Number(f.costPerSqft) || 0,
+          }))
+          .filter((f) => f.label && f.areaSqft > 0 && f.costPerSqft > 0)
+      )},
       ${body.feePercent ?? null},
       ${totals.projectCost},
       ${totals.feeAmount},
@@ -348,6 +382,107 @@ router.patch("/group/:groupId", async (req, res) => {
   }
 });
 
+/** Update one invoice (and optionally sync client name/location across the group) */
+router.patch("/invoice/:invoiceId", async (req, res) => {
+  try {
+    const invoiceId = req.params.invoiceId;
+    const body = req.body as ClientPayload & { syncClientInfo?: boolean };
+    const existing = await sql`SELECT * FROM clients WHERE id = ${invoiceId}`;
+    if (!existing[0]) {
+      res.status(404).json({ error: "Invoice not found" });
+      return;
+    }
+    const name = String(body?.name || existing[0].name).trim();
+    const location = String(body?.location || existing[0].location).trim();
+    const projectName = String(body?.projectName || "").trim();
+    if (!name || !location || !projectName) {
+      res.status(400).json({ error: "name, location, projectName required" });
+      return;
+    }
+    if (existing[0].completed) {
+      res.status(400).json({ error: "Completed invoices cannot be edited" });
+      return;
+    }
+
+    const feeMode = body.feeMode || (existing[0].fee_mode as FeeMode);
+    const advance = Number(body.advanceAmount ?? existing[0].advance_amount) || 0;
+    const totals = calcTotals({
+      feeMode,
+      areaSqft: body.areaSqft ?? null,
+      costPerSqft: body.costPerSqft ?? null,
+      feePercent: body.feePercent ?? null,
+      fixedAmount: body.fixedAmount ?? null,
+      advanceAmount: advance,
+      additionalWorks: body.additionalWorks || [],
+      visitIncluded: body.visitIncluded !== false,
+      visitFee: body.visitFee ?? 0,
+    });
+
+    await sql`
+      UPDATE clients SET
+        name = ${name},
+        location = ${location},
+        project_name = ${projectName},
+        work_types = ${JSON.stringify(body.workTypes || [])},
+        work_type_custom = ${(body.workTypeCustom || "").trim() || null},
+        fee_mode = ${feeMode},
+        area_sqft = ${body.areaSqft ?? null},
+        cost_per_sqft = ${body.costPerSqft ?? null},
+        floors = ${JSON.stringify(
+          (body.floors || [])
+            .map((f) => ({
+              label: String(f.label || "").trim(),
+              areaSqft: Number(f.areaSqft) || 0,
+              costPerSqft: Number(f.costPerSqft) || 0,
+            }))
+            .filter((f) => f.label && f.areaSqft > 0 && f.costPerSqft > 0)
+        )},
+        fee_percent = ${body.feePercent ?? null},
+        project_cost = ${totals.projectCost},
+        fee_amount = ${totals.feeAmount},
+        fixed_amount = ${body.fixedAmount ?? null},
+        additional_works = ${JSON.stringify(
+          (body.additionalWorks || []).filter(
+            (w) => w.name?.trim() && (Number(w.qty) > 0 || Number(w.rate) > 0)
+          )
+        )},
+        visit_included = ${Boolean(body.visitIncluded)},
+        visit_fee = ${totals.visitFee},
+        total_bill = ${totals.totalBill},
+        advance_amount = ${advance},
+        advance_date = ${advance > 0 ? body.advanceDate || null : null},
+        balance = ${totals.balance}
+      WHERE id = ${invoiceId}
+    `;
+
+    if (body.syncClientInfo !== false) {
+      const groupId =
+        (existing[0].group_id as string) || String(existing[0].id);
+      await sql`
+        UPDATE clients
+        SET name = ${name}, location = ${location}
+        WHERE group_id = ${groupId} OR id = ${groupId}
+      `;
+    }
+
+    // Keep advance schedule row amount in sync when present
+    if (advance > 0) {
+      await sql`
+        UPDATE schedule_items
+        SET amount = ${advance},
+            due_date = COALESCE(${body.advanceDate || null}, due_date)
+        WHERE invoice_id = ${invoiceId} AND kind = 'advance'
+      `;
+    }
+
+    const updated = await sql`SELECT * FROM clients WHERE id = ${invoiceId}`;
+    res.json(mapClientRow(updated[0]));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed";
+    res.status(500).json({ error: message });
+  }
+});
+
 /** Settle all dues and mark customer complete */
 router.post("/group/:groupId/complete", async (req, res) => {
   try {
@@ -451,7 +586,7 @@ router.post("/", async (req, res) => {
       res.status(400).json({ error: "name, location, projectName required" });
       return;
     }
-    const groupId = id("grp");
+    const groupId = await nextClientGroupId();
     const invoice = await insertInvoice({
       groupId,
       body,

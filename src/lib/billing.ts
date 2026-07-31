@@ -15,6 +15,12 @@ export type AdditionalWork = {
   rate: number;
 };
 
+export type FloorArea = {
+  label: string;
+  areaSqft: number;
+  costPerSqft: number;
+};
+
 export type ClientPayload = {
   name: string;
   location: string;
@@ -24,6 +30,7 @@ export type ClientPayload = {
   feeMode: FeeMode;
   areaSqft?: number | null;
   costPerSqft?: number | null;
+  floors?: FloorArea[];
   feePercent?: number | null;
   fixedAmount?: number | null;
   additionalWorks?: AdditionalWork[];
@@ -242,6 +249,29 @@ export function mapClientRow(row: Record<string, unknown>) {
     feeMode: row.fee_mode as FeeMode,
     areaSqft: row.area_sqft != null ? Number(row.area_sqft) : null,
     costPerSqft: row.cost_per_sqft != null ? Number(row.cost_per_sqft) : null,
+    floors: (() => {
+      const raw = row.floors;
+      let list: unknown[] = [];
+      if (Array.isArray(raw)) list = raw;
+      else if (typeof raw === "string") {
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) list = parsed;
+        } catch {
+          list = [];
+        }
+      }
+      return list
+        .map((f) => {
+          const row = f as Record<string, unknown>;
+          return {
+            label: String(row.label || "").trim(),
+            areaSqft: Number(row.areaSqft) || 0,
+            costPerSqft: Number(row.costPerSqft) || 0,
+          };
+        })
+        .filter((f) => f.label && f.areaSqft > 0);
+    })(),
     feePercent: row.fee_percent != null ? Number(row.fee_percent) : null,
     projectCost: Number(row.project_cost),
     feeAmount: Number(row.fee_amount),
