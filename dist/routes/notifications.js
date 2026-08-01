@@ -27,6 +27,7 @@ router.get("/", async (_req, res) => {
       WHERE s.paid = FALSE
         AND s.due_date <= ${today}
         AND s.kind IN ('installment', 'one_time', 'stage', 'advance')
+        AND COALESCE(c.completed, FALSE) = FALSE
       ORDER BY s.due_date ASC, s.created_at ASC
     `;
         res.json(rows.map((r) => {

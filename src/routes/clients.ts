@@ -64,12 +64,20 @@ async function insertInvoice(opts: {
   const totals = calcTotals(body);
   const invoiceId = id("inv");
   const invoiceNo = await nextInvoiceNo();
-  const advance = Number(body.advanceAmount) || 0;
-  const plan = totals.balance <= 0 ? "none" : body.paymentPlan || "none";
+  const isQuotation = body.documentType === "quotation";
+  const documentType = isQuotation ? "quotation" : "invoice";
+  const advance = isQuotation ? 0 : Number(body.advanceAmount) || 0;
+  const plan = isQuotation
+    ? "none"
+    : totals.balance <= 0
+      ? "none"
+      : body.paymentPlan || "none";
+  // Quotations are estimates — not receivables
+  const balance = isQuotation ? 0 : totals.balance;
 
   await sql`
     INSERT INTO clients (
-      id, group_id, invoice_no, name, location, project_name, work_types, work_type_custom, fee_mode,
+      id, group_id, invoice_no, document_type, name, location, project_name, work_types, work_type_custom, fee_mode,
       area_sqft, cost_per_sqft, floors, fee_percent, project_cost, fee_amount,
       fixed_amount, additional_works, visit_included, visit_fee,
       total_bill, advance_amount, advance_date, balance,
@@ -79,6 +87,7 @@ async function insertInvoice(opts: {
       ${invoiceId},
       ${groupId},
       ${invoiceNo},
+      ${documentType},
       ${name.trim()},
       ${body.location.trim()},
       ${body.projectName.trim()},
@@ -110,7 +119,7 @@ async function insertInvoice(opts: {
       ${totals.totalBill},
       ${advance},
       ${advance > 0 ? body.advanceDate || null : null},
-      ${totals.balance},
+      ${balance},
       ${plan},
       ${plan === "installment" ? body.installmentMode || null : null},
       ${plan === "installment" ? body.installmentMonths || null : null},
@@ -119,7 +128,9 @@ async function insertInvoice(opts: {
     )
   `;
 
-  const scheduleRows = buildSchedule({
+  const scheduleRows = isQuotation
+    ? []
+    : buildSchedule({
     clientId: groupId,
     balance: totals.balance,
     advanceAmount: advance,

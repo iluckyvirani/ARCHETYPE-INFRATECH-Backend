@@ -6,6 +6,28 @@ const router = Router();
 function id(prefix) {
     return `${prefix}_${randomUUID().slice(0, 8)}`;
 }
+/** Client / group ID format: A.I-001 … A.I-999, then A.I-1000+ */
+function parseClientGroupNo(groupId) {
+    const m = String(groupId || "").trim().match(/^A\.I-(\d+)$/i);
+    if (!m)
+        return 0;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : 0;
+}
+function formatClientGroupId(n) {
+    const num = Math.max(1, Math.floor(n));
+    return `A.I-${String(num).padStart(3, "0")}`;
+}
+async function nextClientGroupId() {
+    const rows = await sql `
+    SELECT DISTINCT group_id FROM clients WHERE group_id IS NOT NULL
+  `;
+    let max = 0;
+    for (const row of rows) {
+        max = Math.max(max, parseClientGroupNo(String(row.group_id)));
+    }
+    return formatClientGroupId(max + 1);
+}
 async function nextInvoiceNo() {
     const rows = await sql `
     SELECT invoice_no FROM clients
@@ -25,34 +47,55 @@ async function insertInvoice(opts) {
     const totals = calcTotals(body);
     const invoiceId = id("inv");
     const invoiceNo = await nextInvoiceNo();
-    const advance = Number(body.advanceAmount) || 0;
-    const plan = totals.balance <= 0 ? "none" : body.paymentPlan || "none";
+    const isQuotation = body.documentType === "quotation";
+    const documentType = isQuotation ? "quotation" : "invoice";
+    const advance = isQuotation ? 0 : Number(body.advanceAmount) || 0;
+    const plan = isQuotation
+        ? "none"
+        : totals.balance <= 0
+            ? "none"
+            : body.paymentPlan || "none";
+    // Quotations are estimates — not receivables
+    const balance = isQuotation ? 0 : totals.balance;
     await sql `
     INSERT INTO clients (
-      id, group_id, invoice_no, name, location, project_name, fee_mode,
-      area_sqft, cost_per_sqft, fee_percent, project_cost, fee_amount,
-      fixed_amount, additional_works, total_bill, advance_amount, advance_date, balance,
+      id, group_id, invoice_no, document_type, name, location, project_name, work_types, work_type_custom, fee_mode,
+      area_sqft, cost_per_sqft, floors, fee_percent, project_cost, fee_amount,
+      fixed_amount, additional_works, visit_included, visit_fee,
+      total_bill, advance_amount, advance_date, balance,
       payment_plan, installment_mode, installment_months, installment_count,
       one_time_due_date
     ) VALUES (
       ${invoiceId},
       ${groupId},
       ${invoiceNo},
+      ${documentType},
       ${name.trim()},
       ${body.location.trim()},
       ${body.projectName.trim()},
+      ${JSON.stringify(body.workTypes || [])},
+      ${(body.workTypeCustom || "").trim() || null},
       ${body.feeMode},
       ${body.areaSqft ?? null},
       ${body.costPerSqft ?? null},
+      ${JSON.stringify((body.floors || [])
+        .map((f) => ({
+        label: String(f.label || "").trim(),
+        areaSqft: Number(f.areaSqft) || 0,
+        costPerSqft: Number(f.costPerSqft) || 0,
+    }))
+        .filter((f) => f.label && f.areaSqft > 0 && f.costPerSqft > 0))},
       ${body.feePercent ?? null},
       ${totals.projectCost},
       ${totals.feeAmount},
       ${body.fixedAmount ?? null},
       ${JSON.stringify((body.additionalWorks || []).filter((w) => w.name?.trim() && (Number(w.qty) > 0 || Number(w.rate) > 0)))},
+      ${Boolean(body.visitIncluded)},
+      ${totals.visitFee},
       ${totals.totalBill},
       ${advance},
       ${advance > 0 ? body.advanceDate || null : null},
-      ${totals.balance},
+      ${balance},
       ${plan},
       ${plan === "installment" ? body.installmentMode || null : null},
       ${plan === "installment" ? body.installmentMonths || null : null},
@@ -60,19 +103,21 @@ async function insertInvoice(opts) {
       ${plan === "one_time" ? body.oneTimeDueDate || null : null}
     )
   `;
-    const scheduleRows = buildSchedule({
-        clientId: groupId,
-        balance: totals.balance,
-        advanceAmount: advance,
-        advanceDate: advance > 0 ? body.advanceDate : null,
-        paymentPlan: plan,
-        installmentMode: body.installmentMode,
-        installmentMonths: body.installmentMonths,
-        installmentCount: body.installmentCount,
-        installmentDueDates: body.installmentDueDates,
-        oneTimeDueDate: body.oneTimeDueDate,
-        stages: body.stages,
-    });
+    const scheduleRows = isQuotation
+        ? []
+        : buildSchedule({
+            clientId: groupId,
+            balance: totals.balance,
+            advanceAmount: advance,
+            advanceDate: advance > 0 ? body.advanceDate : null,
+            paymentPlan: plan,
+            installmentMode: body.installmentMode,
+            installmentMonths: body.installmentMonths,
+            installmentCount: body.installmentCount,
+            installmentDueDates: body.installmentDueDates,
+            oneTimeDueDate: body.oneTimeDueDate,
+            stages: body.stages,
+        });
     const today = todayISO();
     for (const row of scheduleRows) {
         const schId = id("sch");
@@ -302,6 +347,138 @@ router.patch("/group/:groupId", async (req, res) => {
         res.status(500).json({ error: message });
     }
 });
+/** Update one invoice (and optionally sync client name/location across the group) */
+router.patch("/invoice/:invoiceId", async (req, res) => {
+    try {
+        const invoiceId = req.params.invoiceId;
+        const body = req.body;
+        const existing = await sql `SELECT * FROM clients WHERE id = ${invoiceId}`;
+        if (!existing[0]) {
+            res.status(404).json({ error: "Invoice not found" });
+            return;
+        }
+        const name = String(body?.name || existing[0].name).trim();
+        const location = String(body?.location || existing[0].location).trim();
+        const projectName = String(body?.projectName || "").trim();
+        if (!name || !location || !projectName) {
+            res.status(400).json({ error: "name, location, projectName required" });
+            return;
+        }
+        if (existing[0].completed) {
+            res.status(400).json({ error: "Completed invoices cannot be edited" });
+            return;
+        }
+        const feeMode = body.feeMode || existing[0].fee_mode;
+        const advance = Number(body.advanceAmount ?? existing[0].advance_amount) || 0;
+        const totals = calcTotals({
+            feeMode,
+            areaSqft: body.areaSqft ?? null,
+            costPerSqft: body.costPerSqft ?? null,
+            feePercent: body.feePercent ?? null,
+            fixedAmount: body.fixedAmount ?? null,
+            advanceAmount: advance,
+            additionalWorks: body.additionalWorks || [],
+            visitIncluded: body.visitIncluded !== false,
+            visitFee: body.visitFee ?? 0,
+        });
+        await sql `
+      UPDATE clients SET
+        name = ${name},
+        location = ${location},
+        project_name = ${projectName},
+        work_types = ${JSON.stringify(body.workTypes || [])},
+        work_type_custom = ${(body.workTypeCustom || "").trim() || null},
+        fee_mode = ${feeMode},
+        area_sqft = ${body.areaSqft ?? null},
+        cost_per_sqft = ${body.costPerSqft ?? null},
+        floors = ${JSON.stringify((body.floors || [])
+            .map((f) => ({
+            label: String(f.label || "").trim(),
+            areaSqft: Number(f.areaSqft) || 0,
+            costPerSqft: Number(f.costPerSqft) || 0,
+        }))
+            .filter((f) => f.label && f.areaSqft > 0 && f.costPerSqft > 0))},
+        fee_percent = ${body.feePercent ?? null},
+        project_cost = ${totals.projectCost},
+        fee_amount = ${totals.feeAmount},
+        fixed_amount = ${body.fixedAmount ?? null},
+        additional_works = ${JSON.stringify((body.additionalWorks || []).filter((w) => w.name?.trim() && (Number(w.qty) > 0 || Number(w.rate) > 0)))},
+        visit_included = ${Boolean(body.visitIncluded)},
+        visit_fee = ${totals.visitFee},
+        total_bill = ${totals.totalBill},
+        advance_amount = ${advance},
+        advance_date = ${advance > 0 ? body.advanceDate || null : null},
+        balance = ${totals.balance}
+      WHERE id = ${invoiceId}
+    `;
+        if (body.syncClientInfo !== false) {
+            const groupId = existing[0].group_id || String(existing[0].id);
+            await sql `
+        UPDATE clients
+        SET name = ${name}, location = ${location}
+        WHERE group_id = ${groupId} OR id = ${groupId}
+      `;
+        }
+        // Keep advance schedule row amount in sync when present
+        if (advance > 0) {
+            await sql `
+        UPDATE schedule_items
+        SET amount = ${advance},
+            due_date = COALESCE(${body.advanceDate || null}, due_date)
+        WHERE invoice_id = ${invoiceId} AND kind = 'advance'
+      `;
+        }
+        const updated = await sql `SELECT * FROM clients WHERE id = ${invoiceId}`;
+        res.json(mapClientRow(updated[0]));
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : "Failed";
+        res.status(500).json({ error: message });
+    }
+});
+/** Settle all dues and mark customer complete */
+router.post("/group/:groupId/complete", async (req, res) => {
+    try {
+        const groupId = req.params.groupId;
+        const today = todayISO();
+        const invoices = await sql `
+      SELECT id FROM clients
+      WHERE group_id = ${groupId} OR id = ${groupId}
+    `;
+        if (!invoices[0]) {
+            res.status(404).json({ error: "Client not found" });
+            return;
+        }
+        const ids = invoices.map((r) => String(r.id));
+        for (const invId of ids) {
+            await sql `
+        UPDATE schedule_items
+        SET paid = TRUE, paid_at = COALESCE(paid_at, ${today})
+        WHERE paid = FALSE
+          AND (
+            invoice_id = ${invId}
+            OR client_id = ${invId}
+            OR client_id = ${groupId}
+          )
+      `;
+            await sql `
+        UPDATE clients
+        SET balance = 0, completed = TRUE, completed_at = ${today}
+        WHERE id = ${invId}
+      `;
+        }
+        await sql `
+      UPDATE clients
+      SET completed = TRUE, completed_at = ${today}, balance = 0
+      WHERE group_id = ${groupId} OR id = ${groupId}
+    `;
+        res.json({ ok: true, completed: true, completedAt: today });
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : "Failed";
+        res.status(500).json({ error: message });
+    }
+});
 router.delete("/group/:groupId", async (req, res) => {
     try {
         const groupId = req.params.groupId;
@@ -358,7 +535,7 @@ router.post("/", async (req, res) => {
             res.status(400).json({ error: "name, location, projectName required" });
             return;
         }
-        const groupId = id("grp");
+        const groupId = await nextClientGroupId();
         const invoice = await insertInvoice({
             groupId,
             body,

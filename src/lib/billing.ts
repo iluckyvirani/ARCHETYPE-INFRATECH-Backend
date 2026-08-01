@@ -2,6 +2,7 @@ export type FeeMode = "percentage" | "fixed" | "area_sqft";
 export type PaymentPlan = "one_time" | "installment" | "stage" | "none";
 export type InstallmentMode = "by_months" | "count_over_months";
 export type ScheduleKind = "advance" | "one_time" | "installment" | "stage";
+export type DocumentType = "invoice" | "quotation";
 
 export type StageInput = {
   name: string;
@@ -36,6 +37,7 @@ export type ClientPayload = {
   additionalWorks?: AdditionalWork[];
   visitIncluded?: boolean;
   visitFee?: number | null;
+  documentType?: DocumentType;
   advanceAmount: number;
   advanceDate?: string | null;
   paymentPlan: PaymentPlan;
@@ -227,6 +229,8 @@ export function mapClientRow(row: Record<string, unknown>) {
     id: row.id as string,
     groupId: (row.group_id as string) || (row.id as string),
     invoiceNo: row.invoice_no as string,
+    documentType:
+      row.document_type === "quotation" ? ("quotation" as const) : ("invoice" as const),
     name: row.name as string,
     location: row.location as string,
     projectName: row.project_name as string,

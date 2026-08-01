@@ -8,17 +8,28 @@ import notificationsRouter from "./routes/notifications.js";
 import migrateRouter from "./routes/migrate.js";
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
-const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+const defaultOrigins = [
+    "http://localhost:5173",
+    "https://archetype-infratech-frotend.vercel.app",
+];
+const allowedOrigins = [
+    ...new Set([
+        ...defaultOrigins,
+        ...(process.env.CLIENT_ORIGIN || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+    ]),
+];
 app.use(cors({
     origin(origin, callback) {
-        if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes("*")) {
+        if (!origin ||
+            allowedOrigins.includes(origin) ||
+            allowedOrigins.includes("*")) {
             callback(null, true);
             return;
         }
-        callback(null, allowedOrigins[0] || true);
+        callback(new Error(`CORS blocked: ${origin}`));
     },
 }));
 app.use(express.json());

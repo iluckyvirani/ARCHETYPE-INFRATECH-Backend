@@ -11,6 +11,9 @@ export function calcTotals(input) {
     const fixed = Number(input.fixedAmount) || 0;
     const advance = Number(input.advanceAmount) || 0;
     const additionalTotal = additionalWorksSum(input.additionalWorks);
+    const visitFee = input.visitIncluded
+        ? 0
+        : round2(Number(input.visitFee) || 0);
     let projectCost = 0;
     let feeAmount = 0;
     if (input.feeMode === "percentage") {
@@ -25,13 +28,13 @@ export function calcTotals(input) {
         projectCost = round2(area * rate);
         feeAmount = projectCost;
     }
-    const totalBill = input.feeMode === "percentage"
-        ? round2(projectCost + feeAmount + additionalTotal)
-        : round2(feeAmount + additionalTotal);
+    // Visit fee is recorded for notes only — not part of billable total
+    const totalBill = round2(feeAmount + additionalTotal);
     return {
         projectCost,
         feeAmount,
         additionalTotal,
+        visitFee,
         totalBill,
         balance: round2(Math.max(0, totalBill - advance)),
     };
@@ -130,18 +133,65 @@ export function mapClientRow(row) {
         id: row.id,
         groupId: row.group_id || row.id,
         invoiceNo: row.invoice_no,
+        documentType: row.document_type === "quotation" ? "quotation" : "invoice",
         name: row.name,
         location: row.location,
         projectName: row.project_name,
+        workTypes: (() => {
+            const raw = row.work_types;
+            if (Array.isArray(raw))
+                return raw.map((x) => String(x));
+            if (typeof raw === "string") {
+                try {
+                    const parsed = JSON.parse(raw);
+                    return Array.isArray(parsed) ? parsed.map((x) => String(x)) : [];
+                }
+                catch {
+                    return [];
+                }
+            }
+            return [];
+        })(),
+        workTypeCustom: row.work_type_custom
+            ? String(row.work_type_custom)
+            : null,
         feeMode: row.fee_mode,
         areaSqft: row.area_sqft != null ? Number(row.area_sqft) : null,
         costPerSqft: row.cost_per_sqft != null ? Number(row.cost_per_sqft) : null,
+        floors: (() => {
+            const raw = row.floors;
+            let list = [];
+            if (Array.isArray(raw))
+                list = raw;
+            else if (typeof raw === "string") {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (Array.isArray(parsed))
+                        list = parsed;
+                }
+                catch {
+                    list = [];
+                }
+            }
+            return list
+                .map((f) => {
+                const row = f;
+                return {
+                    label: String(row.label || "").trim(),
+                    areaSqft: Number(row.areaSqft) || 0,
+                    costPerSqft: Number(row.costPerSqft) || 0,
+                };
+            })
+                .filter((f) => f.label && f.areaSqft > 0);
+        })(),
         feePercent: row.fee_percent != null ? Number(row.fee_percent) : null,
         projectCost: Number(row.project_cost),
         feeAmount: Number(row.fee_amount),
         fixedAmount: row.fixed_amount != null ? Number(row.fixed_amount) : null,
         additionalWorks,
         additionalTotal,
+        visitIncluded: Boolean(row.visit_included),
+        visitFee: row.visit_fee != null ? Number(row.visit_fee) : 0,
         totalBill: Number(row.total_bill),
         advanceAmount: Number(row.advance_amount),
         advanceDate: (() => {
@@ -166,6 +216,8 @@ export function mapClientRow(row) {
         oneTimeDueDate: row.one_time_due_date
             ? String(row.one_time_due_date).slice(0, 10)
             : null,
+        completed: Boolean(row.completed),
+        completedAt: toDateOnly(row.completed_at),
         createdAt: (() => {
             const raw = row.created_at;
             if (raw instanceof Date)

@@ -72,4 +72,36 @@ export async function migrate() {
     await sql `
     UPDATE schedule_items SET invoice_id = client_id WHERE invoice_id IS NULL
   `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS completed BOOLEAN NOT NULL DEFAULT FALSE
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS completed_at DATE
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS work_types JSONB NOT NULL DEFAULT '[]'::jsonb
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS work_type_custom TEXT
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS visit_included BOOLEAN NOT NULL DEFAULT FALSE
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS visit_fee NUMERIC NOT NULL DEFAULT 0
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS floors JSONB NOT NULL DEFAULT '[]'::jsonb
+  `;
+    await sql `
+    ALTER TABLE clients
+    ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'invoice'
+  `;
 }
