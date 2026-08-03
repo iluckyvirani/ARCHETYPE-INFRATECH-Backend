@@ -416,7 +416,12 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
     }
 
     const feeMode = body.feeMode || (existing[0].fee_mode as FeeMode);
-    const advance = Number(body.advanceAmount ?? existing[0].advance_amount) || 0;
+    const isQuotation =
+      body.documentType === "quotation" ||
+      existing[0].document_type === "quotation";
+    const advance = isQuotation
+      ? 0
+      : Number(body.advanceAmount ?? existing[0].advance_amount) || 0;
     const totals = calcTotals({
       feeMode,
       areaSqft: body.areaSqft ?? null,
@@ -428,6 +433,7 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
       visitIncluded: body.visitIncluded !== false,
       visitFee: body.visitFee ?? 0,
     });
+    const balance = isQuotation ? 0 : totals.balance;
 
     await sql`
       UPDATE clients SET
@@ -462,7 +468,8 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
         total_bill = ${totals.totalBill},
         advance_amount = ${advance},
         advance_date = ${advance > 0 ? body.advanceDate || null : null},
-        balance = ${totals.balance}
+        balance = ${balance},
+        payment_plan = ${isQuotation ? "none" : existing[0].payment_plan}
       WHERE id = ${invoiceId}
     `;
 
