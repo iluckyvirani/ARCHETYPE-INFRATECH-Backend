@@ -2,10 +2,13 @@ import { Router } from "express";
 import { randomUUID } from "crypto";
 import { sql } from "../db.js";
 import {
+  addMonths,
   buildSchedule,
   calcTotals,
   mapClientRow,
   mapScheduleRow,
+  round2,
+  toDateOnly,
   todayISO,
   type ClientPayload,
   type FeeMode,
@@ -202,6 +205,48 @@ router.get("/", async (_req, res) => {
   try {
     const rows = await sql`SELECT * FROM clients ORDER BY created_at DESC`;
     res.json(rows.map((r) => mapClientRow(r as Record<string, unknown>)));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Failed";
+    res.status(500).json({ error: message });
+  }
+});
+
+/** Business-wide ledger: total billed, total received, total due (invoices only — quotations excluded) */
+router.get("/ledger/summary", async (_req, res) => {
+  try {
+    const billedRows = await sql`
+      SELECT
+        COALESCE(SUM(total_bill), 0) AS total_billed,
+        COUNT(*) AS invoice_count,
+        COUNT(DISTINCT COALESCE(group_id, id)) AS client_count
+      FROM clients
+      WHERE document_type != 'quotation'
+    `;
+    const receivedRows = await sql`
+      SELECT COALESCE(SUM(s.paid_amount), 0) AS total_received
+      FROM schedule_items s
+      JOIN clients c ON c.id = COALESCE(s.invoice_id, s.client_id)
+      WHERE c.document_type != 'quotation' AND s.paid = TRUE
+    `;
+    const pendingRows = await sql`
+      SELECT COUNT(*) AS pending_count
+      FROM schedule_items s
+      JOIN clients c ON c.id = COALESCE(s.invoice_id, s.client_id)
+      WHERE c.document_type != 'quotation' AND s.paid = FALSE
+    `;
+
+    const totalBilled = round2(Number(billedRows[0]?.total_billed) || 0);
+    const totalReceived = round2(Number(receivedRows[0]?.total_received) || 0);
+    const totalDue = round2(Math.max(0, totalBilled - totalReceived));
+
+    res.json({
+      totalBilled,
+      totalReceived,
+      totalDue,
+      invoiceCount: Number(billedRows[0]?.invoice_count) || 0,
+      clientCount: Number(billedRows[0]?.client_count) || 0,
+      pendingCount: Number(pendingRows[0]?.pending_count) || 0,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed";
     res.status(500).json({ error: message });
@@ -493,6 +538,77 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
       `;
     }
 
+    // Rebalance unpaid EMI/installment/stage rows to match the edited total.
+    // Already-collected rows are left untouched; the remaining balance is
+    // redistributed across unpaid rows in their existing proportions.
+    if (!isQuotation) {
+      const rows = (await sql`
+        SELECT * FROM schedule_items
+        WHERE invoice_id = ${invoiceId} AND kind != 'advance'
+        ORDER BY due_date ASC, created_at ASC
+      `) as Record<string, unknown>[];
+      const paidRows = rows.filter((r) => Boolean(r.paid));
+      const unpaidRows = rows.filter((r) => !r.paid);
+      const alreadyCollected = paidRows.reduce(
+        (s, r) => s + (Number(r.paid_amount) || Number(r.amount) || 0),
+        0
+      );
+      const remaining = round2(Math.max(0, balance - alreadyCollected));
+
+      if (unpaidRows.length > 0) {
+        const oldUnpaidTotal = unpaidRows.reduce(
+          (s, r) => s + (Number(r.amount) || 0),
+          0
+        );
+        let allocated = 0;
+        for (let i = 0; i < unpaidRows.length; i++) {
+          const row = unpaidRows[i];
+          const isLast = i === unpaidRows.length - 1;
+          let amount: number;
+          if (isLast) {
+            amount = round2(remaining - allocated);
+          } else if (oldUnpaidTotal > 0) {
+            amount = round2((Number(row.amount) / oldUnpaidTotal) * remaining);
+          } else {
+            amount = round2(remaining / unpaidRows.length);
+          }
+          amount = Math.max(0, amount);
+          allocated = round2(allocated + amount);
+          await sql`
+            UPDATE schedule_items SET amount = ${amount} WHERE id = ${row.id}
+          `;
+        }
+      } else if (remaining > 0 && existing[0].payment_plan !== "none") {
+        // No unpaid rows left to absorb the increase — open a new one
+        const schId = id("sch");
+        const dueDate = body.oneTimeDueDate || todayISO();
+        const kind =
+          existing[0].payment_plan === "stage"
+            ? "stage"
+            : existing[0].payment_plan === "one_time"
+              ? "one_time"
+              : "installment";
+        await sql`
+          INSERT INTO schedule_items (
+            id, client_id, invoice_id, kind, label, amount, due_date, paid, paid_at
+          ) VALUES (
+            ${schId}, ${invoiceId}, ${invoiceId}, ${kind},
+            ${"Balance due (adjusted)"}, ${remaining}, ${dueDate}, ${false}, ${null}
+          )
+        `;
+        await sql`
+          INSERT INTO notifications (
+            id, client_id, schedule_item_id, title, message, due_date, read
+          ) VALUES (
+            ${id("ntf")}, ${invoiceId}, ${schId},
+            ${"Payment due"},
+            ${`${name} — Balance due (adjusted) ₹${remaining.toLocaleString("en-IN")} due ${dueDate}`},
+            ${dueDate}, ${false}
+          )
+        `;
+      }
+    }
+
     const updated = await sql`SELECT * FROM clients WHERE id = ${invoiceId}`;
     res.json(mapClientRow(updated[0]));
   } catch (error) {
@@ -518,7 +634,7 @@ router.post("/group/:groupId/complete", async (req, res) => {
     for (const invId of ids) {
       await sql`
         UPDATE schedule_items
-        SET paid = TRUE, paid_at = COALESCE(paid_at, ${today})
+        SET paid = TRUE, paid_at = COALESCE(paid_at, ${today}), paid_amount = amount
         WHERE paid = FALSE
           AND (
             invoice_id = ${invId}
@@ -624,9 +740,9 @@ router.patch("/:id/schedule/:scheduleId", async (req, res) => {
       typeof req.body?.paidAt === "string" ? req.body.paidAt.slice(0, 10) : null;
     const paidAt = paid ? bodyPaidAt || todayISO() : null;
     const scope = req.params.id;
-    await sql`
-      UPDATE schedule_items
-      SET paid = ${paid}, paid_at = ${paidAt}
+
+    const existing = await sql`
+      SELECT * FROM schedule_items
       WHERE id = ${req.params.scheduleId}
         AND (
           client_id = ${scope}
@@ -639,6 +755,101 @@ router.patch("/:id/schedule/:scheduleId", async (req, res) => {
           )
         )
     `;
+    const item = existing[0] as Record<string, unknown> | undefined;
+    if (!item) {
+      res.status(404).json({ error: "Schedule item not found" });
+      return;
+    }
+
+    const scheduledAmount = Number(item.amount) || 0;
+    const rawPaidAmount = req.body?.paidAmount;
+    const hasPaidAmount =
+      rawPaidAmount !== undefined && rawPaidAmount !== null && rawPaidAmount !== "";
+    const paidAmount = paid
+      ? round2(Math.max(0, hasPaidAmount ? Number(rawPaidAmount) || 0 : scheduledAmount))
+      : 0;
+
+    await sql`
+      UPDATE schedule_items
+      SET paid = ${paid}, paid_at = ${paidAt}, paid_amount = ${paidAmount}
+      WHERE id = ${req.params.scheduleId}
+    `;
+
+    // Roll a shortfall into the next upcoming EMI, or credit an overpayment against it
+    let diff = paid ? round2(scheduledAmount - paidAmount) : 0;
+    if (diff !== 0) {
+      const clientRef = String(item.invoice_id || item.client_id);
+      const dueDate = toDateOnly(item.due_date) || todayISO();
+
+      const upcoming = await sql`
+        SELECT * FROM schedule_items
+        WHERE (invoice_id = ${clientRef} OR client_id = ${clientRef})
+          AND id != ${req.params.scheduleId}
+          AND paid = FALSE
+          AND kind != 'advance'
+        ORDER BY due_date ASC, created_at ASC
+      `;
+
+      for (const next of upcoming) {
+        if (diff === 0) break;
+        const nextId = String(next.id);
+        const nextAmount = Number(next.amount) || 0;
+        if (diff > 0) {
+          // Shortfall: add the unpaid remainder onto the next due EMI
+          await sql`
+            UPDATE schedule_items SET amount = ${round2(nextAmount + diff)}
+            WHERE id = ${nextId}
+          `;
+          diff = 0;
+        } else {
+          // Overpayment: credit it against the next EMI, cascading if fully covered
+          const credit = Math.min(nextAmount, -diff);
+          const remaining = round2(nextAmount - credit);
+          if (remaining <= 0) {
+            await sql`
+              UPDATE schedule_items
+              SET amount = 0, paid = TRUE, paid_at = ${paidAt}, paid_amount = ${nextAmount}
+              WHERE id = ${nextId}
+            `;
+            diff = round2(diff + credit);
+          } else {
+            await sql`
+              UPDATE schedule_items SET amount = ${remaining}
+              WHERE id = ${nextId}
+            `;
+            diff = 0;
+          }
+        }
+      }
+
+      if (diff > 0) {
+        // No upcoming EMI to absorb the shortfall — open a new carried-balance row
+        const schId = id("sch");
+        const newDueDate = addMonths(dueDate, 1);
+        const carryKind = item.kind === "advance" ? "installment" : String(item.kind);
+        await sql`
+          INSERT INTO schedule_items (
+            id, client_id, invoice_id, kind, label, amount, due_date, paid, paid_at
+          ) VALUES (
+            ${schId}, ${clientRef}, ${clientRef}, ${carryKind},
+            ${"Balance due (carried forward)"}, ${diff}, ${newDueDate}, ${false}, ${null}
+          )
+        `;
+        const clientRows = await sql`SELECT name FROM clients WHERE id = ${clientRef}`;
+        const clientName = clientRows[0] ? String(clientRows[0].name) : "Client";
+        await sql`
+          INSERT INTO notifications (
+            id, client_id, schedule_item_id, title, message, due_date, read
+          ) VALUES (
+            ${id("ntf")}, ${clientRef}, ${schId},
+            ${"Payment due"},
+            ${`${clientName} — Balance due (carried forward) ₹${diff.toLocaleString("en-IN")} due ${newDueDate}`},
+            ${newDueDate}, ${false}
+          )
+        `;
+      }
+    }
+
     res.json({ ok: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Failed";

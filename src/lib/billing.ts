@@ -348,5 +348,6 @@ export function mapScheduleRow(row: Record<string, unknown>) {
     dueDate: toDateOnly(row.due_date) || todayISO(),
     paid: Boolean(row.paid),
     paidAt: toDateOnly(row.paid_at),
+    paidAmount: row.paid_amount != null ? Number(row.paid_amount) : 0,
   };
 }

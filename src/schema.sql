@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS schedule_items (
   due_date DATE NOT NULL,
   paid BOOLEAN NOT NULL DEFAULT FALSE,
   paid_at DATE,
+  paid_amount NUMERIC NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

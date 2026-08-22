@@ -121,4 +121,14 @@ export async function migrate() {
     ALTER TABLE clients
     ADD COLUMN IF NOT EXISTS document_type TEXT NOT NULL DEFAULT 'invoice'
   `;
+
+  await sql`
+    ALTER TABLE schedule_items
+    ADD COLUMN IF NOT EXISTS paid_amount NUMERIC NOT NULL DEFAULT 0
+  `;
+
+  await sql`
+    UPDATE schedule_items SET paid_amount = amount
+    WHERE paid = TRUE AND paid_amount = 0
+  `;
 }
