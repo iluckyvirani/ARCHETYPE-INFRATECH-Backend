@@ -479,6 +479,13 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
       visitFee: body.visitFee ?? 0,
     });
     const balance = isQuotation ? 0 : totals.balance;
+    const plan = isQuotation
+      ? "none"
+      : balance <= 0
+        ? "none"
+        : body.paymentPlan ||
+          (existing[0].payment_plan as string) ||
+          "none";
 
     await sql`
       UPDATE clients SET
@@ -514,7 +521,19 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
         advance_amount = ${advance},
         advance_date = ${advance > 0 ? body.advanceDate || null : null},
         balance = ${balance},
-        payment_plan = ${isQuotation ? "none" : existing[0].payment_plan}
+        payment_plan = ${plan},
+        installment_mode = ${
+          plan === "installment" ? body.installmentMode || null : null
+        },
+        installment_months = ${
+          plan === "installment" ? body.installmentMonths || null : null
+        },
+        installment_count = ${
+          plan === "installment" ? body.installmentCount || null : null
+        },
+        one_time_due_date = ${
+          plan === "one_time" ? body.oneTimeDueDate || null : null
+        }
       WHERE id = ${invoiceId}
     `;
 
@@ -530,17 +549,35 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
 
     // Keep advance schedule row amount in sync when present
     if (advance > 0) {
-      await sql`
-        UPDATE schedule_items
-        SET amount = ${advance},
-            due_date = COALESCE(${body.advanceDate || null}, due_date)
+      const advanceRows = await sql`
+        SELECT id FROM schedule_items
         WHERE invoice_id = ${invoiceId} AND kind = 'advance'
+        LIMIT 1
       `;
+      if (advanceRows[0]) {
+        await sql`
+          UPDATE schedule_items
+          SET amount = ${advance},
+              due_date = COALESCE(${body.advanceDate || null}, due_date)
+          WHERE id = ${advanceRows[0].id}
+        `;
+      } else {
+        const schId = id("sch");
+        const dueDate = body.advanceDate || todayISO();
+        const paid = dueDate <= todayISO();
+        await sql`
+          INSERT INTO schedule_items (
+            id, client_id, invoice_id, kind, label, amount, due_date, paid, paid_at
+          ) VALUES (
+            ${schId}, ${invoiceId}, ${invoiceId}, ${"advance"},
+            ${"Advance"}, ${advance}, ${dueDate}, ${paid}, ${paid ? dueDate : null}
+          )
+        `;
+      }
     }
 
-    // Rebalance unpaid EMI/installment/stage rows to match the edited total.
-    // Already-collected rows are left untouched; the remaining balance is
-    // redistributed across unpaid rows in their existing proportions.
+    // Rebuild unpaid EMI/installment/stage rows from the edited payment plan.
+    // Already-collected rows are left untouched.
     if (!isQuotation) {
       const rows = (await sql`
         SELECT * FROM schedule_items
@@ -555,57 +592,48 @@ router.patch("/invoice/:invoiceId", async (req, res) => {
       );
       const remaining = round2(Math.max(0, balance - alreadyCollected));
 
-      if (unpaidRows.length > 0) {
-        const oldUnpaidTotal = unpaidRows.reduce(
-          (s, r) => s + (Number(r.amount) || 0),
-          0
-        );
-        let allocated = 0;
-        for (let i = 0; i < unpaidRows.length; i++) {
-          const row = unpaidRows[i];
-          const isLast = i === unpaidRows.length - 1;
-          let amount: number;
-          if (isLast) {
-            amount = round2(remaining - allocated);
-          } else if (oldUnpaidTotal > 0) {
-            amount = round2((Number(row.amount) / oldUnpaidTotal) * remaining);
-          } else {
-            amount = round2(remaining / unpaidRows.length);
-          }
-          amount = Math.max(0, amount);
-          allocated = round2(allocated + amount);
+      for (const row of unpaidRows) {
+        await sql`DELETE FROM notifications WHERE schedule_item_id = ${row.id}`;
+        await sql`DELETE FROM schedule_items WHERE id = ${row.id}`;
+      }
+
+      if (remaining > 0 && plan !== "none") {
+        const scheduleRows = buildSchedule({
+          clientId: invoiceId,
+          balance: remaining,
+          advanceAmount: 0,
+          advanceDate: null,
+          paymentPlan: plan as "one_time" | "installment" | "stage" | "none",
+          installmentMode: body.installmentMode,
+          installmentMonths: body.installmentMonths,
+          installmentCount: body.installmentCount,
+          installmentDueDates: body.installmentDueDates,
+          oneTimeDueDate: body.oneTimeDueDate,
+          stages: body.stages,
+        }).filter((r) => r.kind !== "advance");
+
+        const today = todayISO();
+        for (const row of scheduleRows) {
+          const schId = id("sch");
           await sql`
-            UPDATE schedule_items SET amount = ${amount} WHERE id = ${row.id}
+            INSERT INTO schedule_items (
+              id, client_id, invoice_id, kind, label, amount, due_date, paid, paid_at
+            ) VALUES (
+              ${schId}, ${invoiceId}, ${invoiceId}, ${row.kind},
+              ${row.label}, ${row.amount}, ${row.dueDate}, ${false}, ${null}
+            )
+          `;
+          await sql`
+            INSERT INTO notifications (
+              id, client_id, schedule_item_id, title, message, due_date, read
+            ) VALUES (
+              ${id("ntf")}, ${invoiceId}, ${schId},
+              ${row.dueDate <= today ? "Payment due" : "Upcoming payment"},
+              ${`${name} — ${row.label} ₹${row.amount.toLocaleString("en-IN")} due ${row.dueDate}`},
+              ${row.dueDate}, ${false}
+            )
           `;
         }
-      } else if (remaining > 0 && existing[0].payment_plan !== "none") {
-        // No unpaid rows left to absorb the increase — open a new one
-        const schId = id("sch");
-        const dueDate = body.oneTimeDueDate || todayISO();
-        const kind =
-          existing[0].payment_plan === "stage"
-            ? "stage"
-            : existing[0].payment_plan === "one_time"
-              ? "one_time"
-              : "installment";
-        await sql`
-          INSERT INTO schedule_items (
-            id, client_id, invoice_id, kind, label, amount, due_date, paid, paid_at
-          ) VALUES (
-            ${schId}, ${invoiceId}, ${invoiceId}, ${kind},
-            ${"Balance due (adjusted)"}, ${remaining}, ${dueDate}, ${false}, ${null}
-          )
-        `;
-        await sql`
-          INSERT INTO notifications (
-            id, client_id, schedule_item_id, title, message, due_date, read
-          ) VALUES (
-            ${id("ntf")}, ${invoiceId}, ${schId},
-            ${"Payment due"},
-            ${`${name} — Balance due (adjusted) ₹${remaining.toLocaleString("en-IN")} due ${dueDate}`},
-            ${dueDate}, ${false}
-          )
-        `;
       }
     }
 
